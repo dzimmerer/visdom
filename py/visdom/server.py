@@ -17,16 +17,18 @@ import getpass
 import hashlib
 import inspect
 import json
+import jsonpatch
 import logging
 import math
 import os
 import time
 import traceback
 from os.path import expanduser
+from collections import OrderedDict, Mapping, Sequence
+from six import string_types
 
 import visdom
 from zmq.eventloop import ioloop
-
 ioloop.install()  # Needs to happen before any tornado imports!
 
 import tornado.ioloop     # noqa E402: gotta install ioloop first
@@ -41,6 +43,7 @@ DEFAULT_HOSTNAME = "localhost"
 DEFAULT_BASE_URL = "/"
 
 here = os.path.abspath(os.path.dirname(__file__))
+COMPACT_SEPARATORS = (',', ':')
 
 
 def check_auth(f):
@@ -573,6 +576,39 @@ class ExistsHandler(BaseHandler):
         self.wrap_func(self, args)
 
 
+def order_by_key(kv):
+    key, val = kv
+    return key
+
+
+# Based on json-stable-stringify-python from @haochi with some usecase modifications
+def recursive_order(node):
+    if isinstance(node, Mapping):
+        ordered_mapping = OrderedDict(sorted(node.items(), key=order_by_key))
+        for key, value in ordered_mapping.items():
+            ordered_mapping[key] = recursive_order(value)
+        return ordered_mapping
+    elif isinstance(node, Sequence):
+        if isinstance(node, (bytes,)):
+            return node
+        elif isinstance(node, string_types):
+            return node
+        else:
+            return [recursive_order(item) for item in node]
+    if isinstance(node, float) and node.is_integer():
+        return int(node)
+    return node
+
+
+def stringify(node):
+    return json.dumps(recursive_order(node), separators=COMPACT_SEPARATORS)
+
+
+def hash_md_window(window_json):
+    json_string = stringify(window_json).encode("utf-8")
+    return hashlib.md5(json_string).hexdigest()
+
+
 class UpdateHandler(BaseHandler):
     def initialize(self, app):
         self.state = app.state
@@ -581,6 +617,16 @@ class UpdateHandler(BaseHandler):
         self.port = app.port
         self.env_path = app.env_path
         self.login_enabled = app.login_enabled
+
+    @staticmethod
+    def update_packet(p, args):
+        old_p = copy.deepcopy(p)
+        p = UpdateHandler.update(p, args)
+        p['contentID'] = get_rand_id()
+        # TODO: make_patch isn't high performance.
+        # If bottlenecked we should build the patch ourselves.
+        patch = jsonpatch.make_patch(old_p, p)
+        return p, patch.patch
 
     @staticmethod
     def update(p, args):
@@ -665,10 +711,20 @@ class UpdateHandler(BaseHandler):
                 p['content']['data'][0]['type']))
             return
 
-        p = UpdateHandler.update(p, args)
-
-        p['contentID'] = get_rand_id()
-        broadcast(handler, p, eid)
+        p, diff_packet = UpdateHandler.update_packet(p, args)
+        # send the smaller of the patch and the updated pane
+        if len(stringify(p)) <= len(stringify(diff_packet)):
+            broadcast(handler, p, eid)
+        else:
+            hashed = hash_md_window(p)
+            broadcast_packet = {
+                'command': 'window_update',
+                'win': args['win'],
+                'env': eid,
+                'content': diff_packet,
+                'finalHash': hashed
+            }
+            broadcast(handler, broadcast_packet, eid)
         handler.write(p['id'])
 
     @check_auth
@@ -769,11 +825,7 @@ class HashHandler(BaseHandler):
         eid = extract_eid(args)
         handler_json = handler.state[eid]['jsons']
         if args['win'] in handler_json:
-            window_json = handler_json[args['win']]
-            json_string = json.dumps(
-                window_json, indent = 2
-            ).encode("utf-8")
-            hashed = hashlib.md5(json_string).hexdigest()
+            hashed = hash_md_window(handler_json[args['win']])
             handler.write(hashed)
         else:
             handler.write('false')
@@ -1102,7 +1154,7 @@ class ErrorHandler(BaseHandler):
 # function that downloads and installs javascript, css, and font dependencies:
 def download_scripts(proxies=None, install_dir=None):
     import visdom
-    print("Downloading scripts. It might take a while.")
+    print("Checking for scripts.")
 
     # location in which to download stuff:
     if install_dir is None:
@@ -1133,7 +1185,7 @@ def download_scripts(proxies=None, install_dir=None):
 
         # - fonts
         '%sclassnames@2.2.5' % b: 'classnames',
-        '%slayout-bin-packer@1.4.0' % b: 'layout_bin_packer',
+        '%slayout-bin-packer@1.4.0/dist/layout-bin-packer.js' % b: 'layout_bin_packer',
         '%sfonts/glyphicons-halflings-regular.eot' % bb:
             'glyphicons-halflings-regular.eot',
         '%sfonts/glyphicons-halflings-regular.woff2' % bb:
@@ -1175,16 +1227,19 @@ def download_scripts(proxies=None, install_dir=None):
             is_built = True
         else:
             os.remove(built_path)
+    if not is_built:
+        print('Downloading scripts, this may take a little while')
 
     # download files one-by-one:
     for (key, val) in ext_files.items():
 
         # set subdirectory:
-        sub_dir = 'fonts'
-        if '.js' in key:
+        if val.endswith('.js'):
             sub_dir = 'js'
-        if '.css' in key:
+        elif val.endswith('.css'):
             sub_dir = 'css'
+        else:
+            sub_dir = 'fonts'
 
         # download file:
         filename = '%s/static/%s/%s' % (install_dir, sub_dir, val)
